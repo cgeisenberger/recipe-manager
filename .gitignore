@@ -1,0 +1,54 @@
+# Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+*.virtualenv
+
+# Recipe Data (User's personal recipes)
+data/
+cookbooks/
+config/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment variables & API keys
+.env
+.env.local
+*.secret
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code project data
+.claude/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+temp/
+tmp/
