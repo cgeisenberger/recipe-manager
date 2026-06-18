@@ -53,10 +53,11 @@ class Recipe:
     markdown_path: str = ""
     mealie_id: Optional[str] = None
     mealie_synced_at: Optional[str] = None
-    
+    mealie_synced_hash: Optional[str] = None  # fingerprint of content at last sync
+
     # Quality
     ocr_confidence: Optional[float] = None
-    
+
     def __post_init__(self):
         if self.ingredients is None:
             self.ingredients = []
@@ -64,6 +65,26 @@ class Recipe:
             self.instructions = []
         if self.tags is None:
             self.tags = []
+
+    def content_fingerprint(self) -> str:
+        """
+        SHA256 of the fields that get pushed to Mealie. Used to detect whether a
+        recipe changed since its last sync (compare against mealie_synced_hash).
+        """
+        payload = json.dumps({
+            'title': self.title,
+            'ingredients': self.ingredients,
+            'instructions': self.instructions,
+            'background_info': self.background_info,
+            'handwritten_notes': self.handwritten_notes,
+            'prep_time': self.prep_time,
+            'cook_time': self.cook_time,
+            'total_time': self.total_time,
+            'servings': self.servings,
+            'tags': self.tags,
+            'cuisine': self.cuisine,
+        }, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 class DatabaseManager:
@@ -160,10 +181,16 @@ class DatabaseManager:
         """)
         
         cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_processing_log_hash 
+            CREATE INDEX IF NOT EXISTS idx_processing_log_hash
             ON processing_log(image_hash)
         """)
-        
+
+        # Migration: add mealie_synced_hash to pre-existing databases
+        cursor.execute("PRAGMA table_info(recipes)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if 'mealie_synced_hash' not in existing_columns:
+            cursor.execute("ALTER TABLE recipes ADD COLUMN mealie_synced_hash TEXT")
+
         conn.commit()
         conn.close()
     
@@ -439,20 +466,46 @@ class DatabaseManager:
     
     # ==================== Mealie Sync Operations ====================
     
-    def update_mealie_sync(self, recipe_id: int, mealie_id: str):
-        """Update Mealie sync status"""
+    def update_mealie_sync(self, recipe_id: int, mealie_id: str, content_hash: Optional[str] = None):
+        """
+        Update Mealie sync status.
+
+        If content_hash is provided, it is stored so future bulk syncs can detect
+        changes. If omitted, any existing hash is left untouched (backward-compatible).
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE recipes 
-            SET mealie_id = ?, mealie_synced_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        """, (mealie_id, recipe_id))
-        
+
+        if content_hash is not None:
+            cursor.execute("""
+                UPDATE recipes
+                SET mealie_id = ?, mealie_synced_at = CURRENT_TIMESTAMP, mealie_synced_hash = ?
+                WHERE id = ?
+            """, (mealie_id, content_hash, recipe_id))
+        else:
+            cursor.execute("""
+                UPDATE recipes
+                SET mealie_id = ?, mealie_synced_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (mealie_id, recipe_id))
+
         conn.commit()
         conn.close()
     
+    def clear_mealie_sync(self, recipe_id: int):
+        """Reset a recipe's Mealie sync state (after it was deleted from Mealie)."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE recipes
+            SET mealie_id = NULL, mealie_synced_at = NULL, mealie_synced_hash = NULL
+            WHERE id = ?
+        """, (recipe_id,))
+
+        conn.commit()
+        conn.close()
+
     def get_unsynced_recipes(self) -> List[Recipe]:
         """Get recipes not yet synced to Mealie"""
         conn = self.get_connection()

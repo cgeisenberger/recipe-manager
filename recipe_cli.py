@@ -10,8 +10,9 @@ from pathlib import Path
 from tabulate import tabulate
 
 from recipe_processor_integrated import IntegratedRecipeProcessor
-from database import DatabaseManager
+from database import DatabaseManager, Cookbook
 from mealie_client import MealieClient
+from cookbook_config import CookbookConfigManager
 
 
 @click.group()
@@ -256,66 +257,134 @@ def sync(cookbook, sync_all, db, mealie_url, mealie_token):
 
 
 @cli.command()
-@click.argument('name')
+@click.argument('name', required=False)
 @click.option('--authors', help='Comma-separated authors')
 @click.option('--language', default='en', help='Language code')
 @click.option('--cuisine', help='Cuisine type')
+@click.option('--sample-page', type=click.Path(exists=True), help='Path to sample page for AI analysis')
+@click.option('--openai-key', envvar='OPENAI_API_KEY', help='OpenAI API key for AI analysis')
 @click.option('--db', default='data/recipes.db', help='Database path')
-def init_cookbook(name, authors, language, cuisine, db):
-    """Initialize a new cookbook"""
-    from database import Cookbook
-    
+@click.option('--interactive', '-i', is_flag=True, help='Interactive mode with prompts')
+def init_cookbook(name, authors, language, cuisine, sample_page, openai_key, db, interactive):
+    """Initialize a new cookbook with optional AI-powered config generation"""
+
     db_manager = DatabaseManager(db)
-    
+    config_manager = CookbookConfigManager(openai_api_key=openai_key)
+
+    # Interactive mode
+    if interactive or not name:
+        click.echo("📚 Create New Cookbook - Interactive Mode\n")
+
+        if not name:
+            name = click.prompt("Cookbook name")
+
+        if not authors:
+            authors = click.prompt("Authors (comma-separated)", default="")
+
+        if not language:
+            language = click.prompt("Language", default="en")
+
+        if not cuisine:
+            cuisine = click.prompt("Cuisine type (optional)", default="")
+
+        # Ask about AI analysis
+        if openai_key and not sample_page:
+            click.echo("\n🤖 AI-Powered Config Generation")
+            click.echo("You can upload a sample recipe page for automatic structure detection.")
+            sample_page = click.prompt("Path to sample page (or press Enter to skip)", default="", show_default=False)
+            if sample_page and not Path(sample_page).exists():
+                click.echo("⚠️  File not found, skipping AI analysis")
+                sample_page = None
+
     # Check if exists
     if db_manager.get_cookbook_by_name(name):
-        click.echo(f"Cookbook already exists: {name}")
+        click.echo(f"❌ Cookbook already exists: {name}")
         return
-    
+
+    # Create folder structure
+    folder_name = name.lower().replace(" ", "-")
+    folder = Path(f"cookbooks/{folder_name}")
+
+    success, msg = config_manager.create_folder_structure(folder)
+    if not success:
+        click.echo(f"❌ {msg}")
+        return
+
+    click.echo(f"✓ Created folder structure: {folder}")
+
+    # Process with AI if sample page provided
+    final_config = None
+    author_list = [a.strip() for a in authors.split(',')] if authors else []
+
+    if sample_page and openai_key:
+        click.echo(f"\n🤖 Analyzing sample page: {Path(sample_page).name}")
+
+        with click.progressbar(length=100, label='Analyzing') as bar:
+            success, ai_config, message = config_manager.analyze_cookbook_structure(sample_page)
+            bar.update(100)
+
+        if success:
+            click.echo("✓ Analysis complete!\n")
+
+            # Merge with user info
+            final_config = config_manager.merge_with_template(
+                ai_config,
+                {
+                    "name": name,
+                    "authors": author_list,
+                    "cuisine": cuisine,
+                    "language": language
+                }
+            )
+
+            # Show summary
+            click.echo("📊 Detected Structure:")
+            click.echo(config_manager.format_config_summary(final_config))
+            click.echo()
+
+            # Ask for confirmation
+            if interactive:
+                if not click.confirm("Use this configuration?", default=True):
+                    click.echo("Creating with basic template instead...")
+                    final_config = None
+        else:
+            click.echo(f"⚠️  Analysis failed: {message}")
+            click.echo("Creating with basic template...\n")
+
+    # Use basic template if no AI config
+    if not final_config:
+        final_config = config_manager.create_config_template(
+            name, authors, language, cuisine
+        )
+        if not sample_page:
+            click.echo("💡 Tip: Use --sample-page to enable AI-powered config generation")
+
+    # Save config
+    success, msg = config_manager.save_config(final_config, folder)
+    if success:
+        click.echo(f"✓ Created config: {folder / 'config.json'}")
+    else:
+        click.echo(f"❌ Error saving config: {msg}")
+        return
+
+    # Add to database
     cookbook = Cookbook(
         name=name,
-        authors=authors or "",
+        authors=", ".join(author_list),
         language=language,
-        cuisine=cuisine or ""
+        cuisine=cuisine,
+        config_path=str(folder / "config.json")
     )
-    
+
     cookbook_id = db_manager.add_cookbook(cookbook)
-    click.echo(f"✓ Created cookbook: {name} (ID: {cookbook_id})")
-    
-    # Create folder structure
-    folder = Path(f"cookbooks/{name}")
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / "images").mkdir(exist_ok=True)
-    (folder / "extracted").mkdir(exist_ok=True)
-    
-    # Create config template
-    config = {
-        "cookbook": {
-            "name": name,
-            "authors": authors.split(',') if authors else [],
-            "language": language,
-            "cuisine": cuisine or ""
-        },
-        "layout": {
-            "has_background_stories": False,
-            "typical_columns": 1
-        },
-        "extraction_hints": {
-            "description": ""
-        },
-        "default_tags": []
-    }
-    
-    config_path = folder / "config.json"
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    click.echo(f"✓ Created folder: {folder}")
-    click.echo(f"✓ Created config: {config_path}")
-    click.echo(f"\nNext steps:")
-    click.echo(f"1. Edit {config_path} with cookbook details")
-    click.echo(f"2. Add images to {folder}/images/")
-    click.echo(f"3. Run: recipe-cli process {folder}/images/")
+    click.echo(f"✓ Added to database (ID: {cookbook_id})")
+
+    # Summary
+    click.echo(f"\n✅ Cookbook '{name}' created successfully!")
+    click.echo(f"\n📂 Next steps:")
+    click.echo(f"   1. Add recipe images to: {folder / 'images'}/")
+    click.echo(f"   2. Process images: python recipe_cli.py process {folder / 'images'}/")
+    click.echo(f"   3. (Optional) Edit config: {folder / 'config.json'}")
 
 
 if __name__ == '__main__':

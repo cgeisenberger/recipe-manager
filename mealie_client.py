@@ -5,14 +5,18 @@ Handles communication with Mealie recipe manager
 
 import requests
 import json
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import base64
 
 
 class MealieClient:
     """Client for Mealie API integration"""
-    
+
+    # Tag applied to every recipe this app pushes to Mealie
+    APP_TAG = "recipe_digitizer"
+
     def __init__(self, base_url: str, api_token: str):
         """
         Initialize Mealie client
@@ -83,104 +87,189 @@ class MealieClient:
         
         return duration
     
-    def format_recipe_for_mealie(self, recipe_data: Dict) -> Dict:
+    @staticmethod
+    def _slugify(text: str) -> str:
+        """Convert a name to a Mealie-style slug."""
+        return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+
+    def _resolve_organizer(self, kind: str, name: str) -> Optional[Dict]:
         """
-        Convert our recipe format to Mealie's format
-        
+        Get-or-create a tag or category and return its full {id, name, slug}.
+
+        Mealie rejects a recipe PUT if a referenced tag/category is sent without
+        its real id (it tries to recreate it and hits a slug collision). So we
+        resolve each one to a complete object first.
+
         Args:
-            recipe_data: Recipe dict from our database
-        
+            kind: 'tags' or 'categories'
+            name: organizer name
+
         Returns:
-            Mealie-formatted recipe dict
+            Full organizer dict, or None if it couldn't be resolved.
         """
-        # Convert ingredients to Mealie format
+        name = name.strip()
+        if not name:
+            return None
+        slug = self._slugify(name)
+
+        # Try existing first
+        try:
+            existing = requests.get(
+                f'{self.base_url}/api/organizers/{kind}/slug/{slug}',
+                headers=self.headers,
+                timeout=10
+            )
+            if existing.status_code == 200:
+                return existing.json()
+        except Exception as e:
+            print(f"  Lookup of {kind} '{name}' failed: {e}")
+
+        # Create it
+        try:
+            created = requests.post(
+                f'{self.base_url}/api/organizers/{kind}',
+                headers=self.headers,
+                json={"name": name},
+                timeout=10
+            )
+            if created.status_code in (200, 201):
+                return created.json()
+            print(f"  Could not create {kind} '{name}': {created.status_code} {created.text[:150]}")
+        except Exception as e:
+            print(f"  Creating {kind} '{name}' failed: {e}")
+
+        return None
+
+    def apply_recipe_fields(self, base: Dict, recipe_data: Dict) -> Dict:
+        """
+        Merge our recipe content into a full Mealie recipe object (from GET).
+
+        Mealie's update endpoint requires the complete object round-tripped back
+        with our fields overwritten. Mealie serializes/accepts camelCase. Tags and
+        categories must be objects carrying a slug; Mealie auto-creates missing ones.
+
+        Args:
+            base: Full recipe object fetched from Mealie (GET /api/recipes/{slug})
+            recipe_data: Our recipe dict from the database
+
+        Returns:
+            The mutated `base` dict, ready to PUT back.
+        """
         ingredients = recipe_data.get('ingredients', [])
         if isinstance(ingredients, str):
             ingredients = json.loads(ingredients)
-        
-        # Convert instructions to Mealie format
+
         instructions = recipe_data.get('instructions', [])
         if isinstance(instructions, str):
             instructions = json.loads(instructions)
-        
-        instructions_formatted = [
-            {"text": instruction} for instruction in instructions
-        ]
-        
-        # Convert tags
+
         tags = recipe_data.get('tags', [])
         if isinstance(tags, str):
             tags = json.loads(tags)
-        
-        # Convert times to ISO 8601
-        prep_time = self.convert_time_to_iso(recipe_data.get('prep_time', ''))
-        cook_time = self.convert_time_to_iso(recipe_data.get('cook_time', ''))
-        total_time = self.convert_time_to_iso(recipe_data.get('total_time', ''))
-        
-        # Build description
-        description = []
+
+        description_parts = []
         if recipe_data.get('background_info'):
-            description.append(recipe_data['background_info'])
+            description_parts.append(recipe_data['background_info'])
         if recipe_data.get('handwritten_notes'):
-            description.append(f"\n**Notes:** {recipe_data['handwritten_notes']}")
-        
-        description_text = "\n\n".join(description) if description else ""
-        
-        mealie_recipe = {
-            "name": recipe_data.get('title', 'Untitled Recipe'),
-            "description": description_text,
-            "recipeIngredient": ingredients,
-            "recipeInstructions": instructions_formatted,
-            "recipeYield": recipe_data.get('servings', ''),
-            "tags": tags,
-        }
-        
-        # Add times if available
-        if prep_time:
-            mealie_recipe['prepTime'] = prep_time
-        if cook_time:
-            mealie_recipe['cookTime'] = cook_time
-        if total_time:
-            mealie_recipe['totalTime'] = total_time
-        
-        # Add optional fields
+            description_parts.append(f"**Notes:** {recipe_data['handwritten_notes']}")
+
+        base['description'] = "\n\n".join(description_parts)
+        base['recipeIngredient'] = [
+            {"note": ing, "originalText": ing, "display": ing}
+            for ing in ingredients
+        ]
+        base['recipeInstructions'] = [{"text": step} for step in instructions]
+        base['recipeYield'] = recipe_data.get('servings', '') or ''
+        # Always tag app-synced recipes, plus the recipe's own tags (deduped)
+        tag_names = list(tags)
+        if not any(t.strip().lower() == self.APP_TAG for t in tag_names):
+            tag_names.append(self.APP_TAG)
+        # Resolve tags to full objects (get-or-create) so Mealie accepts the PUT
+        base['tags'] = [
+            resolved for name in tag_names
+            if (resolved := self._resolve_organizer('tags', name)) is not None
+        ]
+
+        prep = self.convert_time_to_iso(recipe_data.get('prep_time', ''))
+        cook = self.convert_time_to_iso(recipe_data.get('cook_time', ''))
+        total = self.convert_time_to_iso(recipe_data.get('total_time', ''))
+        if prep:
+            base['prepTime'] = prep
+        if cook:
+            base['cookTime'] = cook
+        if total:
+            base['totalTime'] = total
+
         if recipe_data.get('cuisine'):
-            mealie_recipe['recipeCategory'] = [recipe_data['cuisine']]
-        
-        return mealie_recipe
+            category = self._resolve_organizer('categories', recipe_data['cuisine'])
+            if category is not None:
+                base['recipeCategory'] = [category]
+
+        return base
     
     def create_recipe(self, recipe_data: Dict) -> Optional[str]:
         """
-        Create a new recipe in Mealie
-        
-        Args:
-            recipe_data: Recipe dict from our database
-        
-        Returns:
-            Mealie recipe ID (slug) if successful, None otherwise
+        Create a new recipe in Mealie.
+
+        Mealie v1.x only accepts a name on POST and returns the slug. The full
+        content must then be round-tripped: GET the created object, overwrite
+        our fields, and PUT it back (Mealie's PUT rejects partial bodies).
+
+        Returns the slug on success, None otherwise.
         """
         try:
-            mealie_recipe = self.format_recipe_for_mealie(recipe_data)
-            
+            title = recipe_data.get('title', 'Untitled Recipe')
+
+            # Step 1: create with name only → slug
             response = requests.post(
                 f'{self.base_url}/api/recipes',
                 headers=self.headers,
-                json=mealie_recipe,
+                json={"name": title},
                 timeout=30
             )
-            
-            if response.status_code in [200, 201]:
-                result = response.json()
-                # Mealie returns the recipe with an 'id' or 'slug' field
-                return result.get('slug') or result.get('id')
-            else:
-                print(f"Failed to create recipe: {response.status_code}")
-                print(f"Response: {response.text}")
+            if response.status_code not in [200, 201]:
+                print(f"Failed to create recipe '{title}': {response.status_code} {response.text}")
                 return None
-                
+
+            result = response.json()
+            slug = result if isinstance(result, str) else (result.get('slug') or result.get('id'))
+            if not slug:
+                print(f"Mealie returned no slug for '{title}'")
+                return None
+            print(f"  Created shell recipe: {slug}")
+
+            # Step 2: populate content via round-trip
+            if self._populate_recipe(slug, recipe_data):
+                return slug
+
+            # Content update failed — remove the empty shell so we don't leave junk
+            print(f"  Content update failed; removing empty shell {slug}")
+            self.delete_recipe(slug)
+            return None
+
         except Exception as e:
             print(f"Error creating recipe: {e}")
             return None
+
+    def _populate_recipe(self, slug: str, recipe_data: Dict) -> bool:
+        """GET the recipe, merge our fields in, and PUT it back."""
+        full = self.get_recipe(slug)
+        if full is None:
+            print(f"  Could not fetch recipe {slug} for update")
+            return False
+
+        payload = self.apply_recipe_fields(full, recipe_data)
+        put = requests.put(
+            f'{self.base_url}/api/recipes/{slug}',
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        if put.status_code in (200, 201):
+            return True
+
+        print(f"  PUT failed for {slug}: {put.status_code} {put.text[:300]}")
+        return False
     
     def upload_recipe_image(self, recipe_id: str, image_path: str) -> bool:
         """
@@ -254,27 +343,18 @@ class MealieClient:
     
     def update_recipe(self, recipe_id: str, recipe_data: Dict) -> bool:
         """
-        Update an existing recipe in Mealie
-        
+        Update an existing recipe in Mealie via GET → merge → PUT round-trip.
+
         Args:
             recipe_id: Mealie recipe ID (slug)
             recipe_data: Recipe dict from our database
-        
+
         Returns:
             True if successful, False otherwise
         """
         try:
-            mealie_recipe = self.format_recipe_for_mealie(recipe_data)
-            
-            response = requests.put(
-                f'{self.base_url}/api/recipes/{recipe_id}',
-                headers=self.headers,
-                json=mealie_recipe,
-                timeout=30
-            )
-            
-            return response.status_code in [200, 201]
-            
+            return self._populate_recipe(recipe_id, recipe_data)
+
         except Exception as e:
             print(f"Error updating recipe: {e}")
             return False
@@ -297,11 +377,59 @@ class MealieClient:
             )
             
             return response.status_code in [200, 204]
-            
+
         except Exception as e:
             print(f"Error deleting recipe: {e}")
             return False
-    
+
+    def list_app_synced_slugs(self) -> List[str]:
+        """
+        Return the slugs of all recipes tagged with APP_TAG (i.e. pushed by this app).
+
+        Mealie's tag-by-slug endpoint embeds the full list of recipes carrying the
+        tag. Returns an empty list if the tag doesn't exist yet.
+        """
+        tag_slug = self._slugify(self.APP_TAG)
+        try:
+            resp = requests.get(
+                f'{self.base_url}/api/organizers/tags/slug/{tag_slug}',
+                headers=self.headers,
+                timeout=10
+            )
+            if resp.status_code != 200:
+                return []
+            recipes = resp.json().get('recipes', [])
+            return [r['slug'] for r in recipes if r.get('slug')]
+        except Exception as e:
+            print(f"Error listing app-synced recipes: {e}")
+            return []
+
+    def delete_app_synced_recipes(self) -> Tuple[List[str], List[str]]:
+        """
+        Delete every recipe tagged with APP_TAG from Mealie.
+
+        Re-fetches the tagged list after each pass so any server-side paging is
+        handled; stops when only previously-failed slugs remain. Recipes added to
+        Mealie by other means (without the tag) are left untouched.
+
+        Returns:
+            (deleted_slugs, failed_slugs)
+        """
+        deleted: List[str] = []
+        failed: List[str] = []
+
+        while True:
+            pending = [s for s in self.list_app_synced_slugs() if s not in failed]
+            if not pending:
+                break
+            for slug in pending:
+                if self.delete_recipe(slug):
+                    deleted.append(slug)
+                else:
+                    failed.append(slug)
+
+        return deleted, failed
+
     def search_recipes(self, query: str) -> List[Dict]:
         """
         Search for recipes in Mealie

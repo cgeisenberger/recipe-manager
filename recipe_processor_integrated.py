@@ -5,7 +5,6 @@ Combines OCR, AI parsing, database storage, and Mealie sync
 
 import os
 import json
-import subprocess
 import base64
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
@@ -14,6 +13,7 @@ from dataclasses import asdict
 
 from database import DatabaseManager, Recipe, Cookbook
 from mealie_client import MealieClient
+from ocr_backends import OCRBackend, auto_detect_backend, iso_to_tesseract_lang
 
 
 class IntegratedRecipeProcessor:
@@ -32,12 +32,21 @@ class IntegratedRecipeProcessor:
         swift_script_path: str = "./apple_ocr.swift",
         openai_api_key: Optional[str] = None,
         mealie_base_url: Optional[str] = None,
-        mealie_api_token: Optional[str] = None
+        mealie_api_token: Optional[str] = None,
+        ocr_backend: Optional[OCRBackend] = None,
+        ocr_lang: str = "eng",
     ):
         self.db = DatabaseManager(db_path)
-        self.swift_script = Path(swift_script_path)
         self.openai_client = OpenAI(api_key=openai_api_key or os.environ.get('OPENAI_API_KEY'))
-        
+
+        if ocr_backend is not None:
+            self.ocr_backend = ocr_backend
+        else:
+            self.ocr_backend = auto_detect_backend(
+                swift_script_path=swift_script_path,
+                tesseract_lang=ocr_lang,
+            )
+
         # Mealie client (optional)
         self.mealie_client = None
         if mealie_base_url and mealie_api_token:
@@ -97,10 +106,10 @@ class IntegratedRecipeProcessor:
         else:
             cookbook_id = cookbook.id
         
-        # Step 4: Run Apple OCR
-        print("🔍 Running Apple Vision OCR...")
+        # Step 4: Run OCR
+        print(f"🔍 Running OCR ({self.ocr_backend.name})...")
         try:
-            ocr_result = self._run_apple_ocr(image_path)
+            ocr_result = self.ocr_backend.extract(image_path)
             ocr_text = ocr_result['text']
             ocr_confidence = ocr_result['confidence']
             print(f"✓ Extracted {len(ocr_text)} characters (confidence: {ocr_confidence:.2%})")
@@ -175,20 +184,6 @@ class IntegratedRecipeProcessor:
         self.db.log_processing(image_path, image_hash, "success", None)
         
         return True, recipe_id, "Success"
-    
-    def _run_apple_ocr(self, image_path: str) -> Dict:
-        """Run Apple Vision OCR"""
-        result = subprocess.run(
-            ['swift', str(self.swift_script), image_path],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"OCR failed: {result.stderr}")
-        
-        return json.loads(result.stdout)
     
     def _parse_with_openai(
         self,
@@ -280,29 +275,90 @@ You excel at:
 
         if config:
             hints = []
-            
-            if config.get('book_name'):
-                hints.append(f"Cookbook: {config['book_name']}")
-            
-            if config.get('authors'):
-                hints.append(f"Authors: {', '.join(config['authors'])}")
-            
-            layout = config.get('layout_hints', {})
+
+            # Support both old flat format and new nested format
+            # Cookbook name
+            cookbook_name = None
+            if 'cookbook' in config and 'name' in config['cookbook']:
+                cookbook_name = config['cookbook']['name']
+            elif 'book_name' in config:
+                cookbook_name = config['book_name']
+
+            if cookbook_name:
+                hints.append(f"Cookbook: {cookbook_name}")
+
+            # Authors
+            authors = None
+            if 'cookbook' in config and 'authors' in config['cookbook']:
+                authors = config['cookbook']['authors']
+            elif 'authors' in config:
+                authors = config['authors']
+
+            if authors:
+                if isinstance(authors, list):
+                    hints.append(f"Authors: {', '.join(authors)}")
+                else:
+                    hints.append(f"Authors: {authors}")
+
+            # Layout - support both 'layout' (new) and 'layout_hints' (old)
+            layout = config.get('layout', config.get('layout_hints', {}))
             if layout:
                 hints.append("\nLayout information:")
+
+                if layout.get('typical_page_structure'):
+                    hints.append(f"- Page structure: {layout['typical_page_structure']}")
+
+                if layout.get('typical_columns'):
+                    hints.append(f"- Columns: {layout['typical_columns']}")
+
                 if layout.get('has_background_stories'):
-                    hints.append(f"- Background stories typically at: {layout.get('background_location', 'top')}")
+                    bg_loc = layout.get('background_location', 'top')
+                    hints.append(f"- Background stories typically at: {bg_loc}")
+
                 if layout.get('ingredients_side'):
                     hints.append(f"- Ingredients typically on: {layout['ingredients_side']}")
+
                 if layout.get('instructions_side'):
                     hints.append(f"- Instructions typically on: {layout['instructions_side']}")
-            
-            if config.get('extraction_instructions'):
+
+                if layout.get('has_handwritten_notes'):
+                    note_locs = layout.get('note_locations', ['margins'])
+                    hints.append(f"- Handwritten notes in: {', '.join(note_locs)}")
+
+            # Extraction hints - support both formats
+            extraction_hints = config.get('extraction_hints', {})
+
+            # Description
+            if extraction_hints.get('description'):
+                hints.append(f"\nDescription: {extraction_hints['description']}")
+
+            # Special instructions - new format
+            if extraction_hints.get('special_instructions'):
+                hints.append(f"\nSpecial instructions: {extraction_hints['special_instructions']}")
+            # Old format fallback
+            elif config.get('extraction_instructions'):
                 hints.append(f"\nSpecial instructions: {config['extraction_instructions']}")
-            
+
+            # Common headings
+            if extraction_hints.get('common_headings'):
+                headings = extraction_hints['common_headings']
+                hints.append("\nCommon headings in this cookbook:")
+                if headings.get('ingredients'):
+                    hints.append(f"- Ingredients: {', '.join(headings['ingredients'])}")
+                if headings.get('instructions'):
+                    hints.append(f"- Instructions: {', '.join(headings['instructions'])}")
+                if headings.get('servings'):
+                    hints.append(f"- Servings: {', '.join(headings['servings'])}")
+
+            # Language-specific
+            if extraction_hints.get('language_specific'):
+                lang_spec = extraction_hints['language_specific']
+                if lang_spec.get('do_not_translate'):
+                    hints.append(f"\nIMPORTANT: Preserve original {lang_spec.get('output_language', 'language')} text exactly - do not translate!")
+
             if hints:
                 base_message += "\n\n" + "\n".join(hints)
-        
+
         return base_message
     
     def _encode_image(self, image_path: str) -> str:
@@ -440,7 +496,24 @@ You excel at:
             elif 'book_name' in config:
                 cookbook_name = config['book_name']
             print(f"📚 Using config for: {cookbook_name}")
-        
+
+            # Update Tesseract language to match cookbook config
+            from ocr_backends import TesseractOCR
+            if isinstance(self.ocr_backend, TesseractOCR):
+                iso_lang = (
+                    config.get('cookbook', {}).get('language')
+                    or config.get('language', 'en')
+                )
+                self.ocr_backend.lang = iso_to_tesseract_lang(iso_lang)
+        else:
+            # No config found - offer to generate one
+            print(f"⚠️  No config.json found in {folder}")
+            print(f"   Processing will use generic extraction (lower accuracy)")
+            print(f"\n💡 Tip: For better results, create a config file:")
+            print(f"   - Run: python recipe_cli.py init-cookbook \"{cookbook_name}\" --interactive")
+            print(f"   - Or use the Streamlit app's Cookbooks tab")
+            print()
+
         # Find images
         image_extensions = {'.jpg', '.jpeg', '.png', '.heic'}
         images = [

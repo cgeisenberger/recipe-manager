@@ -4,3 +4,4 @@ requests>=2.28.0
 click>=8.0.0
 tabulate>=0.9.0
 streamlit>=1.28.0
+pytesseract>=0.3.10  # optional: needed for TesseractOCR backend (Linux/Raspberry Pi)
