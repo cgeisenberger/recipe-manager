@@ -362,9 +362,23 @@ You excel at:
         return base_message
     
     def _encode_image(self, image_path: str) -> str:
-        """Encode image to base64"""
-        with open(image_path, 'rb') as f:
-            return base64.b64encode(f.read()).decode('utf-8')
+        """
+        Encode an image to base64 JPEG for the OpenAI vision API.
+
+        JPEGs are sent as-is; other formats (PNG, HEIC, …) are converted to JPEG so
+        the API always receives a supported format. HEIC decoding requires
+        pillow-heif (registered on import in ocr_backends).
+        """
+        if Path(image_path).suffix.lower() in ('.jpg', '.jpeg'):
+            with open(image_path, 'rb') as f:
+                return base64.b64encode(f.read()).decode('utf-8')
+
+        import io
+        from PIL import Image
+        with Image.open(image_path) as img:
+            buffer = io.BytesIO()
+            img.convert('RGB').save(buffer, format='JPEG', quality=90)
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
     
     def _export_markdown(
         self,

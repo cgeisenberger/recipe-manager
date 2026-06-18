@@ -1,0 +1,19 @@
+services:
+  recipe-digitizer:
+    build: .
+    image: recipe-digitizer:latest
+    container_name: recipe-digitizer
+    restart: always
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env                       # provides OPENAI_API_KEY (see .env.example)
+    volumes:
+      - ./data:/app/data           # recipes.db persists across restarts
+      - ./cookbooks:/app/cookbooks # source images + markdown exports persist
+      - ./config:/app/config       # mealie_config.json (Mealie URL + token)
+    # The app reaches Mealie via the base_url in config/mealie_config.json
+    # (http://mealie.home). Docker forwards DNS to the host's resolver, so the
+    # Pi-hole name should resolve inside the container. If it doesn't, pin it:
+    # extra_hosts:
+    #   - "mealie.home:192.168.1.50"   # <- your Pi's LAN IP

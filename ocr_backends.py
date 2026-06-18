@@ -11,6 +11,14 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TypedDict, Optional
 
+# Teach Pillow to open HEIC/HEIF (iPhone photos) if pillow-heif is installed.
+# Imported here because this is the lowest-level module every entry point loads.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
+
 
 class OCRResult(TypedDict):
     text: str

@@ -1,0 +1,32 @@
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Version control & tooling
+.git/
+.gitignore
+.github/
+.claude/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Runtime data — mounted as volumes, must NOT be baked into the image
+data/
+cookbooks/
+config/
+
+# Secrets
+.env
+*.secret
+
+# macOS-only OCR backend (Tesseract is used in the container)
+apple_ocr.swift
+
+# Docs & assets not needed at runtime
+*.md
+*.png
+*.swift
+.DS_Store

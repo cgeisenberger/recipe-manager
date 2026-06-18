@@ -46,6 +46,10 @@ recipe-manager/
 ├── mealie_client.py                 # Mealie REST client
 ├── cookbook_config.py               # AI-powered cookbook config wizard
 ├── requirements.txt
+├── Dockerfile                       # Container image (Tesseract + app)
+├── docker-compose.yml               # Service definition for the Pi
+├── .dockerignore
+├── .env.example                     # Template for OPENAI_API_KEY
 ├── config/
 │   ├── settings.yaml                # Global settings (optional)
 │   └── mealie_config.json           # Mealie URL + API token (gitignored)
@@ -176,6 +180,100 @@ Both the nested format above and an older flat format (`book_name`, `layout_hint
 | `extraction_hints.common_headings` | object | Language-specific heading words |
 | `extraction_hints.language_specific.do_not_translate` | bool | Keep original language (true for non-English) |
 | `default_tags` | array | Tags applied to all recipes from this cookbook |
+
+---
+
+## 🐳 Docker (Raspberry Pi deployment)
+
+The repo ships a `Dockerfile` and `docker-compose.yml` so the app can run as a long-lived service on a Raspberry Pi — sitting nicely alongside a Dockerized Mealie. The image bundles Tesseract (with German/French/Italian/Spanish language packs), so OCR works without any macOS dependency; the app auto-selects Tesseract inside the container.
+
+### Prerequisites
+
+- **64-bit Raspberry Pi OS (arm64).** `streamlit` pulls in `pandas`/`pyarrow`, which have prebuilt arm64 wheels — on 32-bit OS there are no `pyarrow` wheels and the build will fail.
+- Docker + the Compose plugin installed (`curl -fsSL https://get.docker.com | sh`).
+- A Pi 4/5 with **4 GB+ RAM** is comfortable (2 GB is tight during the build).
+
+### Step-by-step setup
+
+Your recipes (`data/recipes.db`), cookbook images, and credentials (`config/mealie_config.json`, the OpenAI key) are **gitignored**, so they must be placed on the Pi separately from the code. The steps below include migrating your existing data. Replace `pi@raspberrypi.local` with your Pi's user@host.
+
+**1. Confirm 64-bit OS** — on the Pi:
+```bash
+uname -m        # aarch64 = good. armv7l = 32-bit → reflash 64-bit Raspberry Pi OS first
+```
+
+**2. Install Docker** — on the Pi:
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+sudo systemctl enable docker        # start Docker (and the app) on boot
+# log out/in (or: newgrp docker), then verify:
+docker version && docker compose version
+```
+
+**3. Copy the project + existing recipes** — from your Mac. `rsync` brings the code *and* the gitignored data/config in one shot:
+```bash
+rsync -av --exclude venv --exclude .git --exclude __pycache__ --exclude .DS_Store \
+  ~/Dropbox/Projekte/recipe-manager/ pi@raspberrypi.local:~/recipe-manager/
+```
+*(Alternatively `git clone` the repo on the Pi, then `scp` `config/mealie_config.json` and `rsync` `data/` + `cookbooks/` over separately.)*
+
+**4. Set the OpenAI key** — on the Pi (the `.env` must exist before starting):
+```bash
+cd ~/recipe-manager
+cp .env.example .env
+nano .env                           # set OPENAI_API_KEY=sk-...
+cat config/mealie_config.json       # confirm the Mealie URL + token came across
+```
+
+**5. Build and start** — on the Pi (first build takes a few minutes):
+```bash
+docker compose up -d --build
+```
+
+**6. Verify** — on the Pi:
+```bash
+docker compose ps                                # State: running (healthy)
+docker compose logs -f                           # watch startup (Ctrl-C to stop)
+curl -fsS http://localhost:8501/_stcore/health   # prints "ok"
+```
+Then open **`http://raspberrypi.local:8501`** (or `http://<pi-ip>:8501`) in a browser.
+
+**7. Confirm Mealie is reachable from the container** — see [Reaching Mealie](#reaching-mealie-from-the-container) below.
+
+`restart: always` plus the enabled Docker service means the container auto-starts after a reboot — no systemd unit needed. Updating later: `git pull` (or re-run the rsync), then `docker compose up -d --build` (see [Everyday commands](#everyday-commands)).
+
+### What persists
+
+`docker-compose.yml` mounts three host folders into the container, so nothing is lost on rebuild or restart:
+
+| Host path | Purpose |
+|-----------|---------|
+| `./data` | `recipes.db` (the database) |
+| `./cookbooks` | source images + Markdown exports |
+| `./config` | `mealie_config.json` (Mealie URL + token) |
+
+The OpenAI key comes from `.env`; neither `.env` nor `config/` is baked into the image (see `.dockerignore`).
+
+### Everyday commands
+
+```bash
+docker compose logs -f                  # follow logs
+docker compose restart                  # restart
+docker compose pull && docker compose up -d --build   # update after `git pull`
+docker compose down                     # stop & remove the container
+```
+
+### Reaching Mealie from the container
+
+The app connects to Mealie using the `base_url` in `config/mealie_config.json` (e.g. `http://mealie.home`). Docker forwards DNS to the host's resolver, so a Pi-hole hostname normally resolves inside the container. If it doesn't, pin it in `docker-compose.yml`:
+
+```yaml
+    extra_hosts:
+      - "mealie.home:192.168.1.50"   # your Pi's LAN IP
+```
+
+> Note: HEIC photos (e.g. straight from an iPhone) are supported in the container via `pillow-heif`, which is included in `requirements.txt`.
 
 ---
 
