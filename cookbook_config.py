@@ -24,6 +24,11 @@ class CookbookConfigManager:
         if openai_api_key:
             openai.api_key = openai_api_key
 
+    def set_openai_key(self, api_key: str) -> None:
+        """Update the key used for AI inference (module-global openai.api_key)."""
+        self.openai_api_key = api_key
+        openai.api_key = api_key
+
     def analyze_cookbook_structure(self, image_path: str) -> Tuple[bool, Dict, str]:
         """
         Analyze a cookbook page to infer structure and generate config

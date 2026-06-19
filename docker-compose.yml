@@ -6,12 +6,10 @@ services:
     restart: always
     ports:
       - "8501:8501"
-    env_file:
-      - .env                       # provides OPENAI_API_KEY (see .env.example)
     volumes:
       - ./data:/app/data           # recipes.db persists across restarts
       - ./cookbooks:/app/cookbooks # source images + markdown exports persist
-      - ./config:/app/config       # mealie_config.json (Mealie URL + token)
+      - ./config:/app/config       # openai_config.json (API key) + mealie_config.json
     # The app reaches Mealie via the base_url in config/mealie_config.json
     # (http://mealie.home). Docker forwards DNS to the host's resolver, so the
     # Pi-hole name should resolve inside the container. If it doesn't, pin it:

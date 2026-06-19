@@ -5,8 +5,8 @@ Upload photos, process recipes, manage database
 
 import streamlit as st
 import pandas as pd
-import os
 import tempfile
+import shutil
 from pathlib import Path
 import json
 from datetime import datetime
@@ -17,6 +17,51 @@ from recipe_processor_integrated import IntegratedRecipeProcessor
 from database import DatabaseManager, Cookbook
 from mealie_client import MealieClient, load_mealie_config
 from cookbook_config import CookbookConfigManager
+
+OPENAI_CONFIG_PATH = "config/openai_config.json"
+
+
+def load_openai_key(config_path: str = OPENAI_CONFIG_PATH) -> Optional[str]:
+    """Read the OpenAI API key from config/openai_config.json.
+
+    This file is the single source of truth (config/ is gitignored). Returns
+    None if the file is missing or the key is blank.
+    """
+    try:
+        with open(config_path) as f:
+            return json.load(f).get("api_key") or None
+    except Exception:
+        return None
+
+
+def apply_openai_key() -> Optional[str]:
+    """Re-read the key from config and push it into the cached LLM clients.
+
+    Called immediately before every LLM action so a key edited on disk takes
+    effect without restarting the app or rebuilding session state.
+    """
+    key = load_openai_key()
+    if key:
+        if st.session_state.get("processor"):
+            st.session_state.processor.set_openai_key(key)
+        if st.session_state.get("config_manager"):
+            st.session_state.config_manager.set_openai_key(key)
+    return key
+
+
+def test_openai_connection(api_key: str):
+    """Lightweight auth check against the OpenAI API.
+
+    Lists models (a cheap, no-cost call) to verify the key authenticates.
+    Returns (ok, message).
+    """
+    try:
+        from openai import OpenAI
+        OpenAI(api_key=api_key).models.list()
+        return True, "Connected"
+    except Exception as e:
+        return False, str(e)
+
 
 # Page config
 st.set_page_config(
@@ -273,8 +318,12 @@ def delete_all_from_mealie(mealie_url: str, mealie_token: str):
     st.rerun()
 
 
-def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=None):
-    """Render the full detail + actions for one recipe (used below the Recipes table)."""
+def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=None, show_actions=True):
+    """Render the full detail for one recipe.
+
+    Used below the Recipes table (with actions) and inside the View Full Recipe
+    modal (read-only — set show_actions=False to avoid opening nested dialogs).
+    """
     cookbooks = {cb.id: cb.name for cb in st.session_state.db.list_cookbooks()}
 
     st.markdown(f"### {recipe.title}")
@@ -300,7 +349,7 @@ def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=N
     # Optional source image (only persistent paths still exist on disk)
     if recipe.image_path and Path(recipe.image_path).exists():
         with st.expander("🖼 Source image"):
-            st.image(recipe.image_path, use_container_width=True)
+            st.image(recipe.image_path, width='stretch')
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -319,6 +368,9 @@ def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=N
         st.info(f"**Notes:** {recipe.handwritten_notes}")
 
     # Actions
+    if not show_actions:
+        return
+
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         if recipe.markdown_path and Path(recipe.markdown_path).exists():
@@ -326,20 +378,20 @@ def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=N
                 st.download_button(
                     "📥 Download MD", f.read(),
                     file_name=f"{recipe.title}.md",
-                    key=f"dl_{recipe.id}", use_container_width=True,
+                    key=f"dl_{recipe.id}", width='stretch',
                 )
     with c2:
-        if st.button("✏️ Edit", key=f"edit_{recipe.id}", use_container_width=True):
+        if st.button("✏️ Edit", key=f"edit_{recipe.id}", width='stretch'):
             edit_recipe_dialog(recipe.id, mealie_enabled, mealie_url, mealie_token)
     with c3:
         if recipe.mealie_id and mealie_enabled:
             st.link_button("🔗 View in Mealie", f"{mealie_url}/recipe/{recipe.mealie_id}",
-                           use_container_width=True)
+                           width='stretch')
         elif mealie_enabled:
-            if st.button("☁️ Sync to Mealie", key=f"sync_{recipe.id}", use_container_width=True):
+            if st.button("☁️ Sync to Mealie", key=f"sync_{recipe.id}", width='stretch'):
                 sync_recipe_to_mealie(recipe, mealie_url, mealie_token)
     with c4:
-        if st.button("🗑️ Delete", key=f"delete_{recipe.id}", use_container_width=True):
+        if st.button("🗑️ Delete", key=f"delete_{recipe.id}", width='stretch'):
             st.session_state.confirm_delete_recipe_id = recipe.id
             st.rerun()
 
@@ -348,18 +400,24 @@ def render_recipe_detail(recipe, mealie_enabled, mealie_url=None, mealie_token=N
 with st.sidebar:
     st.title("⚙️ Settings")
     
-    # OpenAI API Key
-    openai_key = st.text_input(
-        "OpenAI API Key",
-        value=os.environ.get('OPENAI_API_KEY', ''),
-        type="password",
-        help="Your OpenAI API key"
-    )
-    
+    # OpenAI integration — key loaded from config/openai_config.json (single source of truth)
+    st.subheader("OpenAI Integration")
+    openai_key = load_openai_key()
     if openai_key:
-        os.environ['OPENAI_API_KEY'] = openai_key
-    
-    # Mealie settings — loaded from config/mealie_config.json
+        st.caption("✓ OpenAI key loaded from config/openai_config.json")
+        if st.button("🔌 Test OpenAI Connection", width='stretch'):
+            with st.spinner("Testing OpenAI connection…"):
+                ok, msg = test_openai_connection(openai_key)
+            if ok:
+                st.success("✓ Connected!")
+            else:
+                st.error(f"✗ Connection failed: {msg}")
+    else:
+        st.caption("⚠️ No OpenAI key — create config/openai_config.json (see README)")
+
+    st.divider()
+
+    # Mealie integration — loaded from config/mealie_config.json
     st.subheader("Mealie Integration")
 
     _mealie_cfg = load_mealie_config()
@@ -367,16 +425,18 @@ with st.sidebar:
     _cfg_token = _mealie_cfg.get('api_token') if _mealie_cfg else None
 
     if _cfg_url and _cfg_token:
-        mealie_enabled = st.checkbox("Enable Mealie", value=True)
-        mealie_url = _cfg_url if mealie_enabled else None
-        mealie_token = _cfg_token if mealie_enabled else None
-        if mealie_enabled:
-            st.caption(f"🔗 {_cfg_url}")
-            if st.button("Test Connection"):
-                if MealieClient(_cfg_url, _cfg_token).test_connection():
-                    st.success("✓ Connected!")
-                else:
-                    st.error("✗ Connection failed")
+        mealie_enabled = True
+        mealie_url = _cfg_url
+        mealie_token = _cfg_token
+        st.caption("✓ Mealie API token loaded from config/mealie_config.json")
+        st.caption(f"🔗 {_cfg_url}")
+        if st.button("🔌 Test Mealie Connection", width='stretch'):
+            with st.spinner("Testing Mealie connection…"):
+                ok = MealieClient(_cfg_url, _cfg_token).test_connection()
+            if ok:
+                st.success("✓ Connected!")
+            else:
+                st.error("✗ Connection failed")
     else:
         st.caption("⚠️ No config found — add config/mealie_config.json")
         mealie_enabled = False
@@ -410,7 +470,7 @@ with st.sidebar:
 
         if st.button(
             "☁️ Sync All to Mealie",
-            use_container_width=True,
+            width='stretch',
             disabled=pending == 0,
             help="Push new and changed recipes; unchanged ones are skipped",
         ):
@@ -430,13 +490,15 @@ with st.sidebar:
             )
             if st.button(
                 "🗑️ Delete All from Mealie",
-                use_container_width=True,
+                width='stretch',
                 disabled=not confirm_delete_all,
             ):
                 delete_all_from_mealie(mealie_url, mealie_token)
 
-    # Initialize processor
-    if openai_key and not st.session_state.processor:
+    # Initialize processor and config manager once. The LLM key is refreshed
+    # from config before each LLM action via apply_openai_key(), so these are
+    # created regardless of whether a key is present yet.
+    if st.session_state.processor is None:
         st.session_state.processor = IntegratedRecipeProcessor(
             db_path="data/recipes.db",
             swift_script_path="apple_ocr.swift",
@@ -445,8 +507,7 @@ with st.sidebar:
             mealie_api_token=_cfg_token,
         )
 
-    # Initialize config manager
-    if openai_key and not st.session_state.config_manager:
+    if st.session_state.config_manager is None:
         st.session_state.config_manager = CookbookConfigManager(openai_api_key=openai_key)
     
     # Database stats
@@ -469,6 +530,16 @@ tab3, tab2, tab1, tab4, tab5 = st.tabs(["📖 Recipes", "📚 Cookbooks", "📤 
 
 
 # ==================== Dialog Functions ====================
+
+@st.dialog("Recipe", width="large")
+def view_recipe_dialog(recipe_id: int, mealie_enabled: bool, mealie_url: str = None, mealie_token: str = None):
+    """Show the full detail for one recipe in a modal (read-only)."""
+    recipe = st.session_state.db.get_recipe(recipe_id)
+    if not recipe:
+        st.error("Recipe not found")
+        return
+    render_recipe_detail(recipe, mealie_enabled, mealie_url, mealie_token, show_actions=False)
+
 
 @st.dialog("Edit Recipe", width="large")
 def edit_recipe_dialog(recipe_id: int, mealie_enabled: bool, mealie_url: str = None, mealie_token: str = None):
@@ -589,11 +660,11 @@ def edit_recipe_dialog(recipe_id: int, mealie_enabled: bool, mealie_url: str = N
         st.divider()
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            save_button = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+            save_button = st.form_submit_button("💾 Save Changes", type="primary", width='stretch')
         with col2:
-            cancel_button = st.form_submit_button("❌ Cancel", use_container_width=True)
+            cancel_button = st.form_submit_button("❌ Cancel", width='stretch')
         with col3:
-            delete_button = st.form_submit_button("🗑️ Delete Recipe", use_container_width=True)
+            delete_button = st.form_submit_button("🗑️ Delete Recipe", width='stretch')
 
     # Handle form submission
     if cancel_button:
@@ -705,7 +776,7 @@ def confirm_delete_dialog(recipe_id: int, mealie_enabled: bool, mealie_url: str 
     col1, col2 = st.columns(2)
 
     with col1:
-        if st.button("✓ Yes, Delete", type="primary", use_container_width=True):
+        if st.button("✓ Yes, Delete", type="primary", width='stretch'):
             success = True
             messages = []
 
@@ -757,9 +828,169 @@ def confirm_delete_dialog(recipe_id: int, mealie_enabled: bool, mealie_url: str 
             st.rerun()
 
     with col2:
-        if st.button("❌ Cancel", use_container_width=True):
+        if st.button("❌ Cancel", width='stretch'):
             st.session_state.confirm_delete_recipe_id = None
             st.rerun()
+
+
+@st.dialog("Delete Cookbook", width="large")
+def confirm_delete_cookbook_dialog(cookbook_id: int, mealie_enabled: bool, mealie_url: str = None, mealie_token: str = None):
+    """Confirm cookbook deletion, including all of its recipes."""
+    cookbook = st.session_state.db.get_cookbook(cookbook_id)
+    if not cookbook:
+        st.error("Cookbook not found")
+        return
+
+    recipes = st.session_state.db.list_recipes(cookbook_id=cookbook_id)
+    synced = [r for r in recipes if r.mealie_id]
+    cookbook_path = Path("cookbooks") / cookbook.name.lower().replace(" ", "-")
+
+    st.warning(f"⚠️ You are about to delete the cookbook **{cookbook.name}**. This cannot be undone.")
+    st.write("This action will delete:")
+    st.write("- The cookbook database entry")
+    if recipes:
+        st.write(f"- All {len(recipes)} recipe(s) in this cookbook (database entries)")
+    if synced and mealie_enabled:
+        st.write(f"- {len(synced)} recipe(s) from Mealie")
+
+    delete_folder = False
+    if cookbook_path.exists():
+        delete_folder = st.checkbox(
+            f"Also delete the folder `{cookbook_path}` from disk "
+            "(source images, Markdown exports, config)",
+            key=f"delete_cookbook_folder_{cookbook_id}",
+        )
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("✓ Yes, Delete", type="primary", width='stretch'):
+            success = True
+            messages = []
+
+            # Delete synced recipes from Mealie first
+            if synced and mealie_enabled and mealie_url and mealie_token:
+                try:
+                    mealie_client = MealieClient(mealie_url, mealie_token)
+                    deleted = sum(1 for r in synced if mealie_client.delete_recipe(r.mealie_id))
+                    messages.append(f"Deleted {deleted}/{len(synced)} recipe(s) from Mealie")
+                    if deleted < len(synced):
+                        success = False
+                except Exception as e:
+                    messages.append(f"Warning: Mealie deletion failed: {e}")
+                    success = False
+
+            # Delete per-recipe Markdown files, unless the whole folder is going
+            if not delete_folder:
+                removed_md = 0
+                for r in recipes:
+                    if r.markdown_path and Path(r.markdown_path).exists():
+                        try:
+                            Path(r.markdown_path).unlink()
+                            removed_md += 1
+                        except Exception as e:
+                            messages.append(f"Warning: Could not delete markdown for '{r.title}': {e}")
+                if removed_md:
+                    messages.append(f"Deleted {removed_md} markdown file(s)")
+
+            # Delete the cookbook folder from disk
+            if delete_folder:
+                try:
+                    shutil.rmtree(cookbook_path)
+                    messages.append(f"Deleted folder {cookbook_path}")
+                except Exception as e:
+                    messages.append(f"Warning: Could not delete folder: {e}")
+                    success = False
+
+            # Delete the cookbook and its recipes from the database
+            try:
+                if st.session_state.db.delete_cookbook(cookbook_id):
+                    messages.append("Deleted cookbook and its recipes from the database")
+                else:
+                    messages.append("Error: Could not delete cookbook from database")
+                    success = False
+            except Exception as e:
+                messages.append(f"Error: Database deletion failed: {e}")
+                success = False
+
+            if success:
+                st.success(f"Cookbook '{cookbook.name}' deleted successfully!")
+            else:
+                st.error("Deletion completed with errors")
+            for msg in messages:
+                st.info(msg)
+
+            st.rerun()
+
+    with col2:
+        if st.button("❌ Cancel", width='stretch'):
+            st.rerun()
+
+
+@st.dialog("Generate Config with AI", width="large")
+def generate_config_dialog(cookbook_id: int):
+    """Upload a sample page and (re)generate the cookbook config via AI.
+
+    Works whether or not a config already exists — an existing config is
+    overwritten. This is how you recover a cookbook whose config fell back to
+    default values when AI generation failed at creation time.
+    """
+    cookbook = st.session_state.db.get_cookbook(cookbook_id)
+    if not cookbook:
+        st.error("Cookbook not found")
+        return
+
+    cookbook_path = Path("cookbooks") / cookbook.name.lower().replace(" ", "-")
+    config_exists = (cookbook_path / "config.json").exists()
+
+    st.markdown(f"### {cookbook.name}")
+    if config_exists:
+        st.info("Analyze a sample page and **overwrite** the current config with the result.")
+    else:
+        st.info("Upload a sample page to detect this cookbook's layout and structure.")
+
+    if not load_openai_key():
+        st.warning("⚠️ No OpenAI key — add it to config/openai_config.json to use AI generation.")
+        return
+
+    sample = st.file_uploader(
+        "Sample page",
+        type=['jpg', 'jpeg', 'png'],
+        key=f"regen_sample_{cookbook_id}",
+    )
+
+    if sample and st.button("🤖 Analyze & Save", type="primary", width='stretch'):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+            tmp_file.write(sample.read())
+            tmp_path = tmp_file.name
+
+        try:
+            with st.spinner("🤖 Analyzing page structure..."):
+                apply_openai_key()
+                success, ai_config, message = st.session_state.config_manager.analyze_cookbook_structure(tmp_path)
+
+            if success:
+                final_config = st.session_state.config_manager.merge_with_template(
+                    ai_config,
+                    {
+                        "name": cookbook.name,
+                        "authors": [a.strip() for a in cookbook.authors.split(",")] if isinstance(cookbook.authors, str) else cookbook.authors,
+                        "cuisine": cookbook.cuisine,
+                        "language": cookbook.language,
+                    },
+                )
+                st.session_state.config_manager.create_folder_structure(cookbook_path)
+                saved, save_msg = st.session_state.config_manager.save_config(final_config, cookbook_path)
+                if saved:
+                    st.success("✓ Config generated and saved!")
+                    st.rerun()
+                else:
+                    st.error(f"Could not save config: {save_msg}")
+            else:
+                st.error(f"Analysis failed: {message}")
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
 
 @st.dialog("View Generated Config", width="large")
@@ -897,7 +1128,7 @@ def edit_cookbook_config_dialog(cookbook_id: int):
 
             col1, col2 = st.columns(2)
             with col1:
-                if st.form_submit_button("💾 Save Config", type="primary", use_container_width=True):
+                if st.form_submit_button("💾 Save Config", type="primary", width='stretch'):
                     # Build updated config
                     updated_config = {
                         "cookbook": {
@@ -940,7 +1171,7 @@ def edit_cookbook_config_dialog(cookbook_id: int):
                         st.error(f"Error saving config: {msg}")
 
             with col2:
-                if st.form_submit_button("❌ Cancel", use_container_width=True):
+                if st.form_submit_button("❌ Cancel", width='stretch'):
                     st.rerun()
 
     with view_tab2:
@@ -955,7 +1186,7 @@ def edit_cookbook_config_dialog(cookbook_id: int):
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("💾 Save JSON", use_container_width=True):
+            if st.button("💾 Save JSON", width='stretch'):
                 try:
                     parsed_config = json.loads(edited_json)
                     success, msg = st.session_state.config_manager.save_config(parsed_config, cookbook_path)
@@ -969,7 +1200,7 @@ def edit_cookbook_config_dialog(cookbook_id: int):
                     st.error(f"Invalid JSON: {e}")
 
         with col2:
-            if st.button("❌ Cancel", use_container_width=True):
+            if st.button("❌ Cancel", width='stretch'):
                 st.rerun()
 
 
@@ -1017,49 +1248,68 @@ with tab1:
         if uploaded_files and selected_cookbook:
             if st.button("🚀 Process Recipes", type="primary"):
                 st.session_state.processing_results = []
-                
+
                 progress_bar = st.progress(0)
-                status_text = st.empty()
-                
+
                 for i, uploaded_file in enumerate(uploaded_files):
-                    status_text.info(f"Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
-                    
-                    # Save to temp file
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-                    
-                    try:
-                        # Process
-                        success, recipe_id, message = st.session_state.processor.process_image(
-                            tmp_path,
-                            selected_cookbook,
-                            skip_duplicates=skip_duplicates,
-                            sync_to_mealie=sync_to_mealie
-                        )
-                        
-                        st.session_state.processing_results.append({
-                            'filename': uploaded_file.name,
-                            'success': success,
-                            'recipe_id': recipe_id,
-                            'message': message
-                        })
-                        
-                    except Exception as e:
-                        st.session_state.processing_results.append({
-                            'filename': uploaded_file.name,
-                            'success': False,
-                            'recipe_id': None,
-                            'message': str(e)
-                        })
-                    
-                    finally:
-                        # Clean up temp file
-                        Path(tmp_path).unlink(missing_ok=True)
-                    
+                    label = f"Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}"
+                    with st.status(label, expanded=True) as status:
+                        # Stream each pipeline step into the status panel
+                        def report(msg, _status=status):
+                            _status.write(msg)
+
+                        # Save to temp file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+                            tmp_file.write(uploaded_file.read())
+                            tmp_path = tmp_file.name
+
+                        try:
+                            report("🔑 Loading OpenAI key…")
+                            apply_openai_key()
+                            success, recipe_id, message = st.session_state.processor.process_image(
+                                tmp_path,
+                                selected_cookbook,
+                                skip_duplicates=skip_duplicates,
+                                sync_to_mealie=sync_to_mealie,
+                                progress_callback=report,
+                            )
+
+                            st.session_state.processing_results.append({
+                                'filename': uploaded_file.name,
+                                'success': success,
+                                'recipe_id': recipe_id,
+                                'message': message,
+                            })
+
+                            if success:
+                                status.update(label=f"✓ {uploaded_file.name}", state="complete", expanded=False)
+                            elif 'duplicate' in message.lower():
+                                report(message)
+                                status.update(
+                                    label=f"⏭️ {uploaded_file.name} (already processed)",
+                                    state="complete", expanded=False,
+                                )
+                            else:
+                                report(f"❌ {message}")
+                                status.update(label=f"✗ {uploaded_file.name}", state="error")
+
+                        except Exception as e:
+                            st.session_state.processing_results.append({
+                                'filename': uploaded_file.name,
+                                'success': False,
+                                'recipe_id': None,
+                                'message': str(e),
+                            })
+                            report(f"❌ {e}")
+                            status.update(label=f"✗ {uploaded_file.name}", state="error")
+
+                        finally:
+                            # Clean up temp file
+                            Path(tmp_path).unlink(missing_ok=True)
+
                     progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                status_text.success(f"✓ Processed {len(uploaded_files)} images!")
+
+                st.success(f"✓ Finished processing {len(uploaded_files)} image(s)!")
     
     with col2:
         st.subheader("Processing Results")
@@ -1077,8 +1327,8 @@ with tab1:
                                 st.markdown(f"**Ingredients:** {len(recipe.ingredients)}")
                                 st.markdown(f"**Steps:** {len(recipe.instructions)}")
                                 
-                                if st.button(f"View Full Recipe", key=f"view_{result['recipe_id']}"):
-                                    st.session_state.selected_recipe = result['recipe_id']
+                                if st.button("View Full Recipe", key=f"view_{result['recipe_id']}"):
+                                    view_recipe_dialog(result['recipe_id'], mealie_enabled, mealie_url, mealie_token)
                 
                 elif 'duplicate' in result['message'].lower():
                     st.info(f"⏭️ {result['filename']} (already processed)")
@@ -1127,7 +1377,7 @@ with tab2:
                 key="sample_page_upload"
             )
 
-            analyze_clicked = st.form_submit_button("🔍 Analyze & Create Cookbook", type="primary", use_container_width=True)
+            analyze_clicked = st.form_submit_button("🔍 Analyze & Create Cookbook", type="primary", width='stretch')
 
         # Handle analysis
         if analyze_clicked:
@@ -1152,6 +1402,7 @@ with tab2:
                             try:
                                 # Analyze with AI
                                 with st.spinner("🤖 Analyzing page structure..."):
+                                    apply_openai_key()
                                     success, ai_config, message = st.session_state.config_manager.analyze_cookbook_structure(tmp_path)
 
                                 if success:
@@ -1333,47 +1584,22 @@ with tab2:
                     with col2:
                         # Action buttons
                         if config_exists:
-                            if st.button("📝 Edit Config", key=f"edit_config_{cookbook.id}", use_container_width=True):
+                            if st.button("📝 Edit Config", key=f"edit_config_{cookbook.id}", width='stretch'):
                                 edit_cookbook_config_dialog(cookbook.id)
+                            # Re-run AI generation even though a config already exists —
+                            # recovers cookbooks left with default values after a failed
+                            # generation at creation time.
+                            if st.button("🤖 Regenerate Config (AI)", key=f"regen_config_{cookbook.id}", width='stretch'):
+                                generate_config_dialog(cookbook.id)
                         else:
-                            if st.button("🤖 Generate Config", key=f"gen_config_{cookbook.id}", use_container_width=True):
-                                st.info("Upload a sample page from this cookbook")
+                            if st.button("🤖 Generate Config", key=f"gen_config_{cookbook.id}", width='stretch'):
+                                generate_config_dialog(cookbook.id)
 
-                                sample = st.file_uploader(
-                                    "Sample Page",
-                                    type=['jpg', 'jpeg', 'png'],
-                                    key=f"sample_{cookbook.id}"
-                                )
-
-                                if sample and openai_key:
-                                    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
-                                        tmp_file.write(sample.read())
-                                        tmp_path = tmp_file.name
-
-                                    try:
-                                        with st.spinner("Analyzing..."):
-                                            success, ai_config, message = st.session_state.config_manager.analyze_cookbook_structure(tmp_path)
-
-                                        if success:
-                                            # Merge and save
-                                            final_config = st.session_state.config_manager.merge_with_template(
-                                                ai_config,
-                                                {
-                                                    "name": cookbook.name,
-                                                    "authors": [a.strip() for a in cookbook.authors.split(",")] if isinstance(cookbook.authors, str) else cookbook.authors,
-                                                    "cuisine": cookbook.cuisine,
-                                                    "language": cookbook.language
-                                                }
-                                            )
-
-                                            st.session_state.config_manager.save_config(final_config, cookbook_path)
-                                            st.success("✓ Config generated!")
-                                            st.rerun()
-                                    finally:
-                                        Path(tmp_path).unlink(missing_ok=True)
-
-                        if st.button("📊 View Recipes", key=f"view_recipes_{cookbook.id}", use_container_width=True):
+                        if st.button("📊 View Recipes", key=f"view_recipes_{cookbook.id}", width='stretch'):
                             st.info(f"Switch to the Browse tab and filter by '{cookbook.name}'")
+
+                        if st.button("🗑️ Delete Cookbook", key=f"delete_cookbook_{cookbook.id}", width='stretch'):
+                            confirm_delete_cookbook_dialog(cookbook.id, mealie_enabled, mealie_url, mealie_token)
 
                     st.divider()
 
@@ -1434,7 +1660,7 @@ with tab3:
         event = st.dataframe(
             table,
             hide_index=True,
-            use_container_width=True,
+            width='stretch',
             on_select="rerun",
             selection_mode="single-row",
             key="recipes_table",

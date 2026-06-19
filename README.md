@@ -49,9 +49,9 @@ recipe-manager/
 ├── Dockerfile                       # Container image (Tesseract + app)
 ├── docker-compose.yml               # Service definition for the Pi
 ├── .dockerignore
-├── .env.example                     # Template for OPENAI_API_KEY
 ├── config/
 │   ├── settings.yaml                # Global settings (optional)
+│   ├── openai_config.json           # OpenAI API key (gitignored)
 │   └── mealie_config.json           # Mealie URL + API token (gitignored)
 ├── data/
 │   └── recipes.db                   # SQLite database
@@ -90,11 +90,17 @@ The app auto-selects an OCR backend at runtime — Apple Vision on macOS, Tesser
 
 ### 3. OpenAI API key
 
-```bash
-export OPENAI_API_KEY="sk-..."
+Create `config/openai_config.json` with your key — this is the single source of truth (the file is gitignored):
+
+```json
+{
+  "api_key": "sk-..."
+}
 ```
 
-Add it to `~/.zshrc` (or `~/.bashrc`) to persist it. In the Streamlit app you can also paste it into the sidebar.
+The app reads this file fresh before every AI call, so you can rotate the key by editing the file without restarting. There is no environment-variable or sidebar fallback.
+
+> The **CLI** (`recipe_cli.py`) is the exception — it takes the key from the `--openai-key` flag or the `OPENAI_API_KEY` environment variable instead. See [CLI](#-cli).
 
 ---
 
@@ -218,11 +224,10 @@ rsync -av --exclude venv --exclude .git --exclude __pycache__ --exclude .DS_Stor
 ```
 *(Alternatively `git clone` the repo on the Pi, then `scp` `config/mealie_config.json` and `rsync` `data/` + `cookbooks/` over separately.)*
 
-**4. Set the OpenAI key** — on the Pi (the `.env` must exist before starting):
+**4. Set the OpenAI key** — on the Pi (`config/openai_config.json` must exist before starting):
 ```bash
 cd ~/recipe-manager
-cp .env.example .env
-nano .env                           # set OPENAI_API_KEY=sk-...
+nano config/openai_config.json      # {"api_key": "sk-..."}
 cat config/mealie_config.json       # confirm the Mealie URL + token came across
 ```
 
@@ -251,9 +256,9 @@ Then open **`http://raspberrypi.local:8501`** (or `http://<pi-ip>:8501`) in a br
 |-----------|---------|
 | `./data` | `recipes.db` (the database) |
 | `./cookbooks` | source images + Markdown exports |
-| `./config` | `mealie_config.json` (Mealie URL + token) |
+| `./config` | `openai_config.json` (API key) + `mealie_config.json` (Mealie URL + token) |
 
-The OpenAI key comes from `.env`; neither `.env` nor `config/` is baked into the image (see `.dockerignore`).
+The OpenAI key comes from `config/openai_config.json`; `config/` is mounted, not baked into the image (see `.dockerignore`).
 
 ### Everyday commands
 
@@ -283,12 +288,12 @@ The app connects to Mealie using the `base_url` in `config/mealie_config.json` (
 streamlit run recipe_app.py
 ```
 
-The sidebar holds your OpenAI key, the Mealie integration (auto-loaded from `config/mealie_config.json`), and a **Sync Database** section. The main area has five tabs:
+The sidebar shows whether the OpenAI key was loaded (from `config/openai_config.json`), the Mealie integration (auto-loaded from `config/mealie_config.json`), and a **Sync Database** section. The main area has five tabs:
 
 | Tab | What it does |
 |-----|--------------|
 | **📖 Recipes** | Sortable table of every recipe (title, cookbook, tags, ingredient/step counts, time, servings, sync status). Click a column header to sort, click a row to open a detail panel with ingredients, instructions, the source image, and actions (Edit, Sync, Download MD, Delete). Filter by cookbook and sync status. |
-| **📚 Cookbooks** | Manage existing cookbooks and create new ones with the AI config wizard. |
+| **📚 Cookbooks** | Manage existing cookbooks (edit config, **regenerate config from a sample page via AI**, view recipes, **delete**) and create new ones with the AI config wizard. Regenerate is available even after a cookbook exists, so you can recover one whose config fell back to default values when AI generation failed at creation time. Deleting a cookbook removes all its recipes — including their Mealie copies (when Mealie is enabled) — and can optionally delete the cookbook's folder from disk. |
 | **📤 Upload** | Drag-and-drop recipe photos, pick a cookbook, and process them (with optional Mealie sync). |
 | **🔍 Search** | Search recipes by title, ingredient, or tag. |
 | **📊 Statistics** | Totals, processing status, Mealie sync counts, and per-cookbook breakdown. |
@@ -334,7 +339,7 @@ python recipe_cli.py init-cookbook "Ottolenghi Simple" \
 python recipe_cli.py init-cookbook --interactive
 ```
 
-Mealie URL/token for the CLI come from `--mealie-url` / `--mealie-token` flags or the `MEALIE_URL` / `MEALIE_TOKEN` environment variables.
+The OpenAI key for the CLI comes from the `--openai-key` flag or the `OPENAI_API_KEY` environment variable (the CLI does **not** read `config/openai_config.json` — that file is the web app's source). Mealie URL/token for the CLI come from `--mealie-url` / `--mealie-token` flags or the `MEALIE_URL` / `MEALIE_TOKEN` environment variables.
 
 ---
 
@@ -424,7 +429,7 @@ The schema self-migrates on startup (e.g. adding the Mealie sync-hash column to 
 
 ## 🐛 Troubleshooting
 
-**OpenAI errors** — confirm `echo $OPENAI_API_KEY` is set, or paste the key into the sidebar.
+**OpenAI errors** — confirm `config/openai_config.json` exists and contains a valid `api_key`. The sidebar shows whether the key was loaded.
 
 **OCR fails (macOS)** — run `swift apple_ocr.swift test.jpg` directly to see the error; ensure Xcode CLT is installed.
 

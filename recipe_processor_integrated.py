@@ -7,7 +7,7 @@ import os
 import json
 import base64
 from pathlib import Path
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Callable
 from openai import OpenAI
 from dataclasses import asdict
 
@@ -51,32 +51,49 @@ class IntegratedRecipeProcessor:
         self.mealie_client = None
         if mealie_base_url and mealie_api_token:
             self.mealie_client = MealieClient(mealie_base_url, mealie_api_token)
-    
+
+    def set_openai_key(self, api_key: str) -> None:
+        """Rebuild the OpenAI client with a new key.
+
+        Lets a long-lived processor pick up a rotated key without being
+        recreated (the client caches the key at construction time).
+        """
+        self.openai_client = OpenAI(api_key=api_key)
+
     def process_image(
         self,
         image_path: str,
         cookbook_name: str,
         config: Optional[Dict] = None,
         skip_duplicates: bool = True,
-        sync_to_mealie: bool = False
+        sync_to_mealie: bool = False,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Tuple[bool, Optional[int], str]:
         """
         Complete processing pipeline for a single image
-        
+
         Args:
             image_path: Path to recipe image
             cookbook_name: Name of the cookbook
             config: Optional cookbook configuration
             skip_duplicates: Skip if image already processed
             sync_to_mealie: Sync to Mealie after processing
-        
+            progress_callback: Optional callable invoked with a human-readable
+                message at each processing step (for live UI status).
+
         Returns:
             (success, recipe_id, message)
         """
         image_path = str(Path(image_path).resolve())
-        
-        print(f"\n📸 Processing: {Path(image_path).name}")
-        
+
+        def report(msg: str):
+            """Emit a step message to stdout and the optional UI callback."""
+            print(msg)
+            if progress_callback:
+                progress_callback(msg)
+
+        report(f"📸 Processing: {Path(image_path).name}")
+
         # Step 1: Calculate image hash
         try:
             image_hash = self.db.calculate_image_hash(image_path)
@@ -107,12 +124,12 @@ class IntegratedRecipeProcessor:
             cookbook_id = cookbook.id
         
         # Step 4: Run OCR
-        print(f"🔍 Running OCR ({self.ocr_backend.name})...")
+        report(f"🔍 Running OCR ({self.ocr_backend.name})...")
         try:
             ocr_result = self.ocr_backend.extract(image_path)
             ocr_text = ocr_result['text']
             ocr_confidence = ocr_result['confidence']
-            print(f"✓ Extracted {len(ocr_text)} characters (confidence: {ocr_confidence:.2%})")
+            report(f"✓ Extracted {len(ocr_text)} characters (confidence: {ocr_confidence:.2%})")
         except Exception as e:
             error_msg = f"OCR failed: {e}"
             print(f"❌ {error_msg}")
@@ -120,10 +137,10 @@ class IntegratedRecipeProcessor:
             return False, None, error_msg
         
         # Step 5: Parse with OpenAI
-        print("🤖 Parsing with OpenAI...")
+        report("🤖 Parsing with OpenAI...")
         try:
             recipe_data = self._parse_with_openai(image_path, ocr_text, config)
-            print(f"✓ Extracted recipe: {recipe_data['title']}")
+            report(f"✓ Extracted recipe: {recipe_data['title']}")
         except Exception as e:
             error_msg = f"OpenAI parsing failed: {e}"
             print(f"❌ {error_msg}")
@@ -153,7 +170,7 @@ class IntegratedRecipeProcessor:
         try:
             recipe_id = self.db.add_recipe(recipe)
             recipe.id = recipe_id
-            print(f"💾 Saved to database (ID: {recipe_id})")
+            report(f"💾 Saved to database (ID: {recipe_id})")
         except Exception as e:
             error_msg = f"Database save failed: {e}"
             print(f"❌ {error_msg}")
@@ -165,18 +182,18 @@ class IntegratedRecipeProcessor:
             markdown_path = self._export_markdown(recipe, cookbook_name, config)
             recipe.markdown_path = markdown_path
             self.db.update_recipe(recipe)
-            print(f"📝 Exported markdown: {markdown_path}")
+            report(f"📝 Exported markdown: {markdown_path}")
         except Exception as e:
             print(f"⚠️  Markdown export failed: {e}")
         
         # Step 9: Sync to Mealie (if enabled)
         if sync_to_mealie and self.mealie_client:
             try:
-                print("☁️  Syncing to Mealie...")
+                report("☁️  Syncing to Mealie...")
                 mealie_id = self._sync_to_mealie(recipe, image_path)
                 if mealie_id:
                     self.db.update_mealie_sync(recipe_id, mealie_id)
-                    print(f"✓ Synced to Mealie: {mealie_id}")
+                    report(f"✓ Synced to Mealie: {mealie_id}")
             except Exception as e:
                 print(f"⚠️  Mealie sync failed: {e}")
         

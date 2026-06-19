@@ -252,9 +252,34 @@ class DatabaseManager:
         cursor.execute("SELECT * FROM cookbooks ORDER BY name")
         rows = cursor.fetchall()
         conn.close()
-        
+
         return [Cookbook(**dict(row)) for row in rows]
-    
+
+    def delete_cookbook(self, cookbook_id: int) -> bool:
+        """
+        Delete a cookbook and every recipe belonging to it.
+
+        Deleting any Mealie copies or files on disk is the caller's
+        responsibility — this only touches the database.
+
+        Returns: True if the cookbook row was removed, False otherwise.
+        """
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+
+            cursor.execute("DELETE FROM recipes WHERE cookbook_id = ?", (cookbook_id,))
+            cursor.execute("DELETE FROM cookbooks WHERE id = ?", (cookbook_id,))
+            deleted = cursor.rowcount > 0
+
+            conn.commit()
+            conn.close()
+
+            return deleted
+        except Exception as e:
+            print(f"Error deleting cookbook: {e}")
+            return False
+
     # ==================== Recipe Operations ====================
     
     def calculate_image_hash(self, image_path: str) -> str:
